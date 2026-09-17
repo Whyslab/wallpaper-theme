@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""wallpaper-theme — интерфейс под цвет обоев.
+
+  wallpaper-theme status                   режим и подключены ли файлы
+  wallpaper-theme mode <off|vivid|tinted>  включить / выключить
+  wallpaper-theme refresh [desktop|lock]   пересчитать после смены обоев
+  wallpaper-theme integrate                подключить к конфигам (делает install.sh)
+  wallpaper-theme unintegrate              отключить от конфигов
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import wallpaper_theme as wt  # noqa: E402
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == "status":
+            print(f"режим: {wt.read_mode()}")
+            for path in (wt.HYPRLAND_CONF, wt.HYPRLOCK_CONF, wt.KITTY_CONF, *wt.ROFI_THEMES):
+                hooked = path.is_file() and wt.MARK in path.read_text(encoding="utf-8")
+                print(f"  {'подключено' if hooked else 'НЕТ':10} {path}")
+            for css in wt.GTK_CSS:
+                hooked = css.is_file() and wt.GTK_START in css.read_text(encoding="utf-8")
+                print(f"  {'подключено' if hooked else 'НЕТ':10} {css}")
+            return 0
+        if cmd == "mode" and len(args) == 1:
+            problems = wt.set_mode(args[0])
+            for p in problems:
+                print(f"внимание: {p}", file=sys.stderr)
+            return 1 if problems else 0
+        if cmd == "refresh":
+            target = args[0] if args else "all"
+            if target not in ("desktop", "lock", "all"):
+                raise wt.ThemeError(f"неизвестная цель: {target}")
+            if wt.read_mode() == "off":
+                return 0  # выключено — после смены обоев пересчитывать нечего
+            problems = wt.refresh(target)
+            if problems:
+                wt.notify("; ".join(problems))
+            return 1 if problems else 0
+        if cmd == "integrate":
+            for path in wt.integrate():
+                print(f"подключено: {path}")
+            return 0
+        if cmd == "unintegrate":
+            wt.unintegrate()
+            print("подключения убраны")
+            return 0
+    except wt.ThemeError as exc:
+        print(f"ошибка: {exc}", file=sys.stderr)
+        return 1
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
