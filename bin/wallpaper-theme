@@ -4,6 +4,7 @@
   wallpaper-theme status                   режим и подключены ли файлы
   wallpaper-theme mode <off|vivid|tinted>  включить / выключить
   wallpaper-theme refresh [desktop|lock]   пересчитать после смены обоев
+  wallpaper-theme warm                     заранее посчитать палитры всех обоев
   wallpaper-theme integrate                подключить к конфигам (делает install.sh)
   wallpaper-theme unintegrate              отключить от конфигов
 """
@@ -38,13 +39,19 @@ def main(argv):
             target = args[0] if args else "all"
             if target not in ("desktop", "lock", "all"):
                 raise wt.ThemeError(f"неизвестная цель: {target}")
-            if wt.read_mode() == "off":
-                wt.ensure_files()  # подключаемые файлы нужны и в выключенном режиме
-                return 0  # после смены обоев пересчитывать нечего
-            problems = wt.refresh(target)
+            # Перед блокировкой экрана ждать занятую блокировку файлов нельзя.
+            problems = wt.refresh(target, wait=1.0 if target == "lock" else 120.0)
             if problems:
                 wt.notify("; ".join(problems))
             return 1 if problems else 0
+        if cmd == "warm":
+            mode = wt.read_mode()
+            if mode == "off":
+                return 0
+            images = sorted(p for p in wt.WALLPAPER_DIR.iterdir()
+                            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
+            print(f"палитры посчитаны: {wt.warm_cache(images, mode)} из {len(images)}")
+            return 0
         if cmd == "integrate":
             for path in wt.integrate():
                 print(f"подключено: {path}")

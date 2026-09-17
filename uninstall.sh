@@ -19,4 +19,4 @@ if [[ -x "$BIN" ]]; then
 fi
 rm -f "$BIN"
 rm -rf "$HOME/.local/share/wallpaper-theme"
-echo "Удалено. Настройки режима: ~/.config/wallpaper-theme, сгенерированные файлы: ~/.cache/wallpaper-theme — можно удалить вручную."
+echo "Удалено. Настройки режима: ~/.config/wallpaper-theme, сгенерированные файлы и палитры: ~/.local/state/wallpaper-theme — можно удалить вручную."

@@ -16,6 +16,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import wallpaper_theme as wt  # noqa: E402
 
+_REAL_PALETTE_FROM_IMAGE = wt.palette_from_image
+
 PALETTE = {
     "primary": "#adc6ff", "on_primary": "#002e69", "surface": "#0f131c",
     "surface_container_lowest": "#0a0e17", "surface_container": "#1b1f28",
@@ -106,7 +108,7 @@ def test_panel_off_only_flips_the_switch():
 
 def test_add_hook_is_idempotent_and_removable():
     text = "general {\n}\n"
-    line = wt.hook_line("hyprland", Path("/tmp/wt"))
+    line = wt.hook_line("hyprland", Path("/tmp/wallpaper-theme"))
     once = wt.add_hook(text, line)
     assert wt.add_hook(once, line) == once
     assert wt.remove_hook(once) == text
@@ -114,7 +116,7 @@ def test_add_hook_is_idempotent_and_removable():
 
 def test_hyprlock_hook_goes_right_after_colors():
     text = "source = ~/.config/hypr/colors.conf\n\nbackground {\n    color = $c_black\n}\n"
-    line = wt.hook_line("hyprlock", Path("/tmp/wt"))
+    line = wt.hook_line("hyprlock", Path("/tmp/wallpaper-theme"))
     out = wt.add_hook(text, line, after=r"^source\s*=.*colors\.conf.*$")
     lines = out.splitlines()
     assert lines[1] == line
@@ -268,7 +270,9 @@ def test_colorless_needs_both_signs():
     assert not wt.is_colorless("#30d7ff", 0.001)   # серая, но с цветным пятном
 
 
-def test_grey_wallpaper_gets_the_monochrome_scheme(monkeypatch, tmp_path):
+def test_grey_wallpaper_gets_the_monochrome_scheme(home, monkeypatch):
+    tmp_path, _, _ = home
+    monkeypatch.setattr(wt, "palette_from_image", _REAL_PALETTE_FROM_IMAGE)
     image = tmp_path / "grey.png"
     image.write_bytes(b"x")
     asked = []
@@ -348,3 +352,94 @@ def test_unsafe_wallpaper_name_is_not_passed_to_the_panel(home, name):
     panel = json.loads((root / ".config/hyprpanel/config.json").read_text())
     assert "theme.matugen" not in panel
     assert problems
+
+
+def _panel_bytes(root):
+    return (root / ".config/hyprpanel/config.json").read_bytes()
+
+
+def test_off_twice_leaves_the_panel_config_alone(home):
+    root, _, _ = home
+    wt.integrate()
+    before = _panel_bytes(root)
+    wt.set_mode("vivid")
+    wt.set_mode("off")
+    wt.set_mode("off")
+    assert _panel_bytes(root) == before
+
+
+def test_off_without_ever_turning_on_leaves_the_panel_alone(home):
+    root, _, _ = home
+    wt.integrate()
+    before = _panel_bytes(root)
+    wt.set_mode("off")
+    assert _panel_bytes(root) == before
+
+
+def test_refresh_queued_behind_off_does_nothing(home):
+    root, _, calls = home
+    wt.integrate()
+    wt.set_mode("vivid")
+    wt.set_mode("off")
+    before = _panel_bytes(root)
+    calls.clear()
+    assert wt.refresh("all") == []
+    assert _panel_bytes(root) == before
+    assert ("hyprctl", "reload") not in calls
+
+
+def test_busy_lock_gives_up_in_time(home):
+    import fcntl
+    import time
+    root, _, _ = home
+    wt.OUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(wt._lock_file(), "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        start = time.monotonic()
+        with pytest.raises(wt.Busy):
+            wt.refresh("lock", mode="vivid", wait=0.3)
+        assert time.monotonic() - start < 1.5
+
+
+def test_user_lines_mentioning_the_tool_survive(home):
+    root, _, _ = home
+    conf = root / ".config/hypr/hyprland.conf"
+    conf.write_text(conf.read_text() + "bind = SUPER, T, exec, wallpaper-theme mode vivid\n")
+    wt.integrate()
+    wt.unintegrate()
+    assert "bind = SUPER, T, exec, wallpaper-theme mode vivid" in conf.read_text()
+
+
+def test_second_palette_comes_from_the_cache(home, monkeypatch):
+    tmp_path, _, _ = home
+    monkeypatch.setattr(wt, "palette_from_image", _REAL_PALETTE_FROM_IMAGE)
+    image = tmp_path / "pic.png"
+    image.write_bytes(b"x")
+    calls = []
+    monkeypatch.setattr(wt, "_matugen",
+                        lambda img, scheme: calls.append(scheme) or dict(PALETTE, primary="#ff0000"))
+    first = wt.palette_from_image(image, "vivid")
+    second = wt.palette_from_image(image, "vivid")
+    assert first == second and calls == ["vibrant"]
+
+
+def test_palette_cache_depends_on_the_file_changing(home, monkeypatch):
+    tmp_path, _, _ = home
+    monkeypatch.setattr(wt, "palette_from_image", _REAL_PALETTE_FROM_IMAGE)
+    image = tmp_path / "pic.png"
+    image.write_bytes(b"x")
+    colours = iter(["#ff0000", "#00ff00"])
+    monkeypatch.setattr(wt, "_matugen", lambda img, scheme: dict(PALETTE, primary=next(colours)))
+    assert wt.palette_from_image(image, "vivid")["primary"] == "#ff0000"
+    image.write_bytes(b"xy")
+    assert wt.palette_from_image(image, "vivid")["primary"] == "#00ff00"
+
+
+def test_matugen_timeout_becomes_a_reported_problem(monkeypatch, tmp_path):
+    import subprocess as sp
+
+    def slow(*args, **kwargs):
+        raise sp.TimeoutExpired(cmd="matugen", timeout=kwargs.get("timeout"))
+    monkeypatch.setattr(wt.subprocess, "run", slow)
+    with pytest.raises(wt.ThemeError):
+        wt._matugen(tmp_path / "x.png", "vibrant")

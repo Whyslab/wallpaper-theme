@@ -71,10 +71,14 @@ scripts = Path(sys.argv[1])
 MARK = "wallpaper-theme"
 
 # Обновления уже встроенного кода из прошлых версий установщика.
-UPGRADES = [(
-'theme_refresh() {\n    command -v wallpaper-theme >/dev/null 2>&1 || return 0\n    ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )\n}',
-'theme_refresh() {\n    command -v wallpaper-theme >/dev/null 2>&1 || return 0\n    if [[ "$1" == lock ]]; then\n        # Блокировка — не в фоне: hypridle сразу после смены картинки запускает\n        # hyprlock, и он успел бы прочитать цвета прошлой картинки (~0,5–1 с).\n        wallpaper-theme refresh lock >/dev/null 2>&1\n    else\n        ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )\n    fi\n}',
-)]
+UPGRADES = [
+    ('theme_refresh() {\n    command -v wallpaper-theme >/dev/null 2>&1 || return 0\n    ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )\n}',
+     'theme_refresh() {\n    command -v wallpaper-theme >/dev/null 2>&1 || return 0\n    if [[ "$1" == lock ]]; then\n        # Блокировка: сразу после этого hypridle запускает hyprlock. Даём пересчёту\n        # не больше 1,5 с (палитры библиотеки посчитаны заранее, обычно это доли\n        # секунды) — оформление никогда не задерживает блокировку экрана.\n        timeout 1.5 wallpaper-theme refresh lock >/dev/null 2>&1\n    else\n        ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )\n    fi\n}'),
+    ('theme_refresh() {\n    command -v wallpaper-theme >/dev/null 2>&1 || return 0\n    if [[ "$1" == lock ]]; then\n        # Блокировка — не в фоне: hypridle сразу после смены картинки запускает\n        # hyprlock, и он успел бы прочитать цвета прошлой картинки (~0,5–1 с).\n        wallpaper-theme refresh lock >/dev/null 2>&1\n    else\n        ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )\n    fi\n}',
+     'theme_refresh() {\n    command -v wallpaper-theme >/dev/null 2>&1 || return 0\n    if [[ "$1" == lock ]]; then\n        # Блокировка: сразу после этого hypridle запускает hyprlock. Даём пересчёту\n        # не больше 1,5 с (палитры библиотеки посчитаны заранее, обычно это доли\n        # секунды) — оформление никогда не задерживает блокировку экрана.\n        timeout 1.5 wallpaper-theme refresh lock >/dev/null 2>&1\n    else\n        ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )\n    fi\n}'),
+    ('# Интерфейс под обои (wallpaper-theme): пересчитать цвета после смены картинки.\n# В фоне — чтобы не задерживать саму смену обоев; при выключенном режиме\n# команда сразу выходит. Нет программы — ничего не делаем.',
+     '# Интерфейс под обои (wallpaper-theme): пересчитать цвета после смены картинки.\n# Рабочий стол — в фоне, чтобы не задерживать смену обоев; при выключенном режиме\n# команда сразу выходит. Нет программы — ничего не делаем.'),
+]
 
 def patch(path, pairs):
     if not path.is_file():
@@ -90,6 +94,9 @@ def patch(path, pairs):
             print(f"   обновлено: {path.name}")
         else:
             print(f"   уже встроено: {path.name}")
+        if path.name == "wallpaper.sh" and "timeout 1.5 wallpaper-theme refresh lock" not in upgraded:
+            print("   !! wallpaper.sh: пересчёт перед блокировкой не ограничен по времени — "
+                  "функция theme_refresh изменена вручную, обнови её по install.sh")
         return
     for anchor, replacement in pairs:
         if text.count(anchor) != 1:
@@ -110,9 +117,10 @@ patch(scripts / "wallpaper.sh", [
 theme_refresh() {
     command -v wallpaper-theme >/dev/null 2>&1 || return 0
     if [[ "$1" == lock ]]; then
-        # Блокировка — не в фоне: hypridle сразу после смены картинки запускает
-        # hyprlock, и он успел бы прочитать цвета прошлой картинки (~0,5–1 с).
-        wallpaper-theme refresh lock >/dev/null 2>&1
+        # Блокировка: сразу после этого hypridle запускает hyprlock. Даём пересчёту
+        # не больше 1,5 с (палитры библиотеки посчитаны заранее, обычно это доли
+        # секунды) — оформление никогда не задерживает блокировку экрана.
+        timeout 1.5 wallpaper-theme refresh lock >/dev/null 2>&1
     else
         ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )
     fi

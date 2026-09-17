@@ -8,7 +8,7 @@
 
 Главный принцип: свои файлы темы не переписываются. В конец каждого конфига один
 раз (`integrate`) добавляется подключение сгенерированного файла из
-~/.cache/wallpaper-theme/. В режиме off эти файлы пустые, поэтому выключение
+~/.local/state/wallpaper-theme/. В режиме off эти файлы пустые, поэтому выключение
 возвращает всё ровно как было, а удаление строк подключения — как до установки.
 
 Что перекрашивается и откуда берётся цвет:
@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
 import signal
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 MODES = ("off", "vivid", "tinted")
@@ -40,7 +42,6 @@ MODE_FILE = CONFIG_DIR / "mode"
 # Не ~/.cache: на эти файлы ссылаются конфиги, а кэш по определению можно стереть —
 # Hyprland на отсутствующий source отвечает ошибкой при каждом входе.
 OUT_DIR = HOME / ".local" / "state" / "wallpaper-theme"
-LEGACY_OUT_DIR = HOME / ".cache" / "wallpaper-theme"
 
 
 def _panel_original():
@@ -50,6 +51,7 @@ def _panel_original():
 def _lock_file():
     return OUT_DIR / ".lock"
 WALLPAPER_STATE = HOME / ".local" / "state" / "hypr-wallpaper"
+WALLPAPER_DIR = HOME / ".config" / "hypr" / "wallpapers"
 
 HYPRLAND_CONF = HOME / ".config" / "hypr" / "hyprland.conf"
 HYPRLOCK_CONF = HOME / ".config" / "hypr" / "hyprlock.conf"
@@ -104,14 +106,22 @@ MATUGEN_FALLBACK_PRIMARY = "#adc6ff"
 COLORLESS_SATURATION = 0.03
 
 
+# Ни один внешний вызов не может висеть бесконечно: на пути блокировки экрана
+# зависший matugen означал бы «экран не блокируется».
+TOOL_TIMEOUT = 30
+
+
 def _matugen(image, scheme):
     """`--source-color-index 0`: без него matugen 4.2 на картинке с несколькими
     главными цветами спрашивает пользователя в терминале, а из скрипта падает."""
-    result = subprocess.run(
-        ["matugen", "image", str(image), "-t", f"scheme-{scheme}", "-m", "dark",
-         "--json", "hex", "--dry-run", "--source-color-index", "0", "-q"],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["matugen", "image", str(image), "-t", f"scheme-{scheme}", "-m", "dark",
+             "--json", "hex", "--dry-run", "--source-color-index", "0", "-q"],
+            capture_output=True, text=True, check=False, timeout=TOOL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ThemeError(f"matugen думал дольше {TOOL_TIMEOUT} с") from exc
     if result.returncode != 0 or not result.stdout.strip():
         raise ThemeError(f"matugen не смог разобрать картинку: {result.stderr.strip()[:200]}")
     return parse_matugen(result.stdout)
@@ -119,11 +129,14 @@ def _matugen(image, scheme):
 
 def saturation(image):
     """Средняя насыщенность картинки 0..1 (уменьшенная копия, это быстро)."""
-    result = subprocess.run(
-        ["magick", str(image), "-resize", "96x96!", "-colorspace", "HSL",
-         "-channel", "G", "-separate", "+channel", "-format", "%[fx:mean]", "info:"],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["magick", str(image), "-resize", "96x96!", "-colorspace", "HSL",
+             "-channel", "G", "-separate", "+channel", "-format", "%[fx:mean]", "info:"],
+            capture_output=True, text=True, check=False, timeout=TOOL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return 1.0
     try:
         return max(0.0, float(result.stdout.strip()))
     except ValueError:
@@ -138,19 +151,48 @@ def is_colorless(vibrant_primary, image_saturation):
             and image_saturation < COLORLESS_SATURATION)
 
 
+def _cache_path(image, mode):
+    stat = Path(image).stat()
+    key = hashlib.sha1(f"{Path(image).resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{mode}".encode())
+    return OUT_DIR / "palettes" / f"{key.hexdigest()}.json"
+
+
 def palette_from_image(image, mode):
-    """Палитра по картинке. У серых обоев — монохромная схема: иначе интерфейс
-    окрасился бы в голубой, которого на картинке нет."""
+    """Палитра по картинке, с кэшем: большие обои считаются до 6–9 секунд, а
+    перед блокировкой экрана ждать нельзя. У серых обоев — монохромная схема:
+    иначе интерфейс окрасился бы в голубой, которого на картинке нет."""
     if mode not in SCHEME:
         raise ThemeError(f"нет палитры для режима {mode}")
     if not image or not Path(image).is_file():
         raise ThemeError(f"нет картинки обоев: {image}")
+    cache = _cache_path(image, mode)
+    with contextlib.suppress(OSError, ValueError):
+        return json.loads(cache.read_text(encoding="utf-8"))
     vibrant = _matugen(image, "vibrant")
-    if is_colorless(vibrant["primary"], saturation(image)):
+    # Насыщенность меряем, только когда matugen вернул свой голубой: это лишняя
+    # секунда на каждую картинку, а у цветных обоев ответ и так ясен.
+    if vibrant["primary"].lower() == MATUGEN_FALLBACK_PRIMARY and is_colorless(
+            vibrant["primary"], saturation(image)):
         palette = _matugen(image, "monochrome")
         palette["_colorless"] = True
-        return palette
-    return vibrant if SCHEME[mode] == "vibrant" else _matugen(image, SCHEME[mode])
+    elif SCHEME[mode] == "vibrant":
+        palette = vibrant
+    else:
+        palette = _matugen(image, SCHEME[mode])
+    with contextlib.suppress(OSError):
+        _write(cache, json.dumps(palette))
+    return palette
+
+
+def warm_cache(images, mode):
+    """Заранее посчитать палитры для библиотеки обоев. Ошибки отдельных картинок
+    пропускаются: это подготовка, а не применение."""
+    done = 0
+    for image in images:
+        with contextlib.suppress(ThemeError, OSError, ValueError):
+            palette_from_image(image, mode)
+            done += 1
+    return done
 
 
 def _rgb(hex_color):
@@ -333,13 +375,17 @@ def set_hyprpanel(config, mode, image, originals=None, scheme=None):
     подменяет их при отрисовке. Выключение возвращает ключи, как были до включения."""
     config = dict(config)
     if mode == "off":
-        for key, value in (originals or {}).items():
+        if not originals:
+            # Нечего возвращать — значит, мы ключи не трогали. Выключаем только
+            # включённое, отсутствующий ключ не дописываем.
+            if config.get("theme.matugen") is True:
+                config["theme.matugen"] = False
+            return config
+        for key, value in originals.items():
             if value == _ABSENT:
                 config.pop(key, None)
             else:
                 config[key] = value
-        if not originals:
-            config["theme.matugen"] = False
         return config
     config["theme.matugen"] = True
     config["theme.matugen_settings.scheme_type"] = scheme or SCHEME[mode]
@@ -386,8 +432,15 @@ def add_hook(text, line, after=None):
     return text + sep + line + "\n"
 
 
+_HOOK_LINE = re.compile(
+    r"^\s*(source\s*=|include\s|@import\s).*" + re.escape(MARK) + r"/", re.M)
+
+
 def remove_hook(text):
-    return "".join(line for line in text.splitlines(keepends=True) if MARK not in line)
+    """Убрать только строки подключения (source/include/@import на наш каталог).
+    Свои строки пользователя, где просто упоминается wallpaper-theme (например,
+    bind на `wallpaper-theme mode vivid`), не трогаются."""
+    return "".join(line for line in text.splitlines(keepends=True) if not _HOOK_LINE.match(line))
 
 
 # ─────────────────────────── действия с системой ───────────────────────────
@@ -468,8 +521,8 @@ def integrate():
 
 
 def unintegrate():
-    """Убрать все строки подключения и блоки GTK. Файлы в кэше остаются, но уже
-    ни на что не влияют."""
+    """Убрать все строки подключения и блоки GTK. Сгенерированные файлы остаются
+    в ~/.local/state/wallpaper-theme, но уже ни на что не влияют."""
     for path in (HYPRLAND_CONF, HYPRLOCK_CONF, KITTY_CONF, *ROFI_THEMES):
         _edit(path, remove_hook)
     for css in GTK_CSS:
@@ -496,24 +549,42 @@ def notify(text):
     _run("notify-send", "-a", "Интерфейс под обои", "Интерфейс под обои", text)
 
 
+class Busy(ThemeError):
+    """Другой пересчёт не отпустил блокировку вовремя."""
+
+
 @contextlib.contextmanager
-def _locked():
+def _locked(wait=120.0):
     """Один пересчёт за раз: иначе быстрые SUPER+W или выключение посреди пересчёта
-    оставляли бы цвета не той картинки, а то и включённую панель после off."""
+    оставляли бы цвета не той картинки, а то и включённую панель после off.
+    Ждём не дольше `wait` секунд."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + wait
     with open(_lock_file(), "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Busy("занято другим пересчётом") from None
+                time.sleep(0.05)
         try:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def refresh(target="all", mode=None):
-    """Пересчитать и применить. target: desktop, lock или all. Возвращает список
-    проблем текстом; прошлые цвета при ошибке остаются как были."""
-    with _locked():
-        return _refresh_locked(target, mode or read_mode())
+def refresh(target="all", mode=None, wait=120.0):
+    """Пересчитать после смены обоев. target: desktop, lock или all. Режим читается
+    под блокировкой: если его успели выключить, пересчитывать нечего. Возвращает
+    список проблем; прошлые цвета при ошибке остаются как были."""
+    with _locked(wait):
+        mode = mode or read_mode()
+        if mode == "off":
+            ensure_files()
+            return []
+        return _refresh_locked(target, mode)
 
 
 def _refresh_locked(target, mode):
@@ -587,12 +658,25 @@ def _apply_live(palette):
             os.kill(pid, signal.SIGUSR1)  # kitty перечитывает конфиг
 
 
+def _warm_in_background():
+    """Посчитать палитры всей библиотеки заранее, с низким приоритетом: тогда
+    случайные обои блокировки берут готовую палитру, и экран блокируется сразу."""
+    with contextlib.suppress(OSError):
+        subprocess.Popen(
+            ["nice", "-n", "19", "wallpaper-theme", "warm"],
+            start_new_session=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+
 def set_mode(mode):
     if mode not in MODES:
         raise ThemeError(f"неизвестный режим: {mode}")
     with _locked():
         _write(MODE_FILE, mode + "\n")
         problems = _refresh_locked("all", mode)
+    if mode != "off":
+        _warm_in_background()
     label = {"off": "выключен", "vivid": "яркий", "tinted": "приглушённый"}[mode]
     if problems:
         notify(f"Режим {label}, но: " + "; ".join(problems))
