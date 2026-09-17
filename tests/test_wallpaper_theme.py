@@ -99,8 +99,7 @@ def test_panel_off_only_flips_the_switch():
     config = {"theme.bar.background": "#000000", "theme.matugen": True,
               "wallpaper.image": "/x.png", "theme.matugen_settings.scheme_type": "vibrant"}
     off = wt.set_hyprpanel(config, "off", "/y.png")
-    assert off["theme.matugen"] is False
-    assert off["theme.bar.background"] == "#000000"
+    assert off == config  # ничего не сохраняли — значит, ничего и не трогали
     on = wt.set_hyprpanel(config, "tinted", "/y.png")
     assert on["theme.matugen_settings.scheme_type"] == "neutral"
     assert on["wallpaper.image"] == "/y.png"
@@ -184,6 +183,9 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(wt, "_run", lambda *cmd: calls.append(cmd) or type("R", (), {"stdout": ""})())
     monkeypatch.setattr(wt, "palette_from_image", lambda image, mode: dict(PALETTE))
     monkeypatch.setattr(wt, "notify", lambda text: calls.append(("notify", text)))
+    # Никаких настоящих фоновых процессов из тестов: они работали бы с настоящим HOME.
+    monkeypatch.setattr(wt, "_warm_in_background", lambda: calls.append(("warm",)))
+    monkeypatch.setattr(wt, "WALLPAPER_DIR", at(".config", "hypr", "wallpapers"))
     return tmp_path, files, calls
 
 
@@ -443,3 +445,73 @@ def test_matugen_timeout_becomes_a_reported_problem(monkeypatch, tmp_path):
     monkeypatch.setattr(wt.subprocess, "run", slow)
     with pytest.raises(wt.ThemeError):
         wt._matugen(tmp_path / "x.png", "vibrant")
+
+
+def test_turning_on_requests_one_warm_and_off_none(home):
+    _, _, calls = home
+    wt.integrate()
+    wt.set_mode("vivid")
+    assert calls.count(("warm",)) == 1
+    calls.clear()
+    wt.set_mode("off")
+    assert ("warm",) not in calls
+
+
+def test_warm_without_a_wallpaper_folder_is_fine(home):
+    assert wt.library_images() == []
+    wt.MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    wt.MODE_FILE.write_text("vivid\n")
+    assert wt.warm() == 0
+
+
+def test_warm_stops_when_the_mode_changes(home, monkeypatch):
+    root, _, _ = home
+    folder = root / ".config/hypr/wallpapers"
+    folder.mkdir(parents=True)
+    for n in range(3):
+        (folder / f"{n}.png").write_bytes(b"x" * (n + 1))
+    wt.MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    wt.MODE_FILE.write_text("vivid\n")
+    seen = []
+
+    def palette(image, mode):
+        seen.append(image.name)
+        wt.MODE_FILE.write_text("off\n")  # пользователь выключил посреди прогрева
+        return dict(PALETTE)
+    monkeypatch.setattr(wt, "palette_from_image", palette)
+    wt.warm()
+    assert seen == ["0.png"]
+
+
+def test_failed_saturation_is_not_cached(home, monkeypatch):
+    tmp_path, _, _ = home
+    monkeypatch.setattr(wt, "palette_from_image", _REAL_PALETTE_FROM_IMAGE)
+    image = tmp_path / "grey.png"
+    image.write_bytes(b"x")
+    monkeypatch.setattr(wt, "_matugen", lambda img, scheme: dict(PALETTE, primary="#adc6ff"))
+    monkeypatch.setattr(wt, "saturation", lambda img: None)
+    wt.palette_from_image(image, "vivid")
+    assert not wt.is_cached(image, "vivid")
+
+
+def test_similar_named_user_folder_is_not_our_hook():
+    text = "source = ~/x/my-wallpaper-theme/a.conf\n"
+    assert wt.remove_hook(text) == text
+
+
+def test_off_leaves_the_users_own_matugen_alone(home):
+    root, _, _ = home
+    conf = root / ".config/hyprpanel/config.json"
+    conf.write_text(json.dumps({"theme.matugen": True}, indent=2))
+    before = conf.read_bytes()
+    wt.integrate()
+    wt.set_mode("off")
+    assert conf.read_bytes() == before
+
+
+def test_lock_refresh_without_cached_palette_asks_for_a_warm(home, monkeypatch):
+    root, _, calls = home
+    wt.integrate()
+    calls.clear()
+    wt.refresh("lock", mode="vivid", wait=1.0)
+    assert ("warm",) in calls

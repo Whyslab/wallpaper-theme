@@ -136,11 +136,11 @@ def saturation(image):
             capture_output=True, text=True, check=False, timeout=TOOL_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return 1.0
+        return None
     try:
         return max(0.0, float(result.stdout.strip()))
     except ValueError:
-        return 1.0  # не смогли измерить — не считаем картинку серой
+        return None  # не смогли измерить
 
 
 def is_colorless(vibrant_primary, image_saturation):
@@ -151,9 +151,15 @@ def is_colorless(vibrant_primary, image_saturation):
             and image_saturation < COLORLESS_SATURATION)
 
 
+# Меняется, когда меняется состав палитры или способ её расчёта: старые записи
+# кэша тогда просто не находятся и пересчитываются.
+CACHE_VERSION = 2
+
+
 def _cache_path(image, mode):
     stat = Path(image).stat()
-    key = hashlib.sha1(f"{Path(image).resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{mode}".encode())
+    key = hashlib.sha1(
+        f"v{CACHE_VERSION}|{Path(image).resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{mode}".encode())
     return OUT_DIR / "palettes" / f"{key.hexdigest()}.json"
 
 
@@ -171,28 +177,69 @@ def palette_from_image(image, mode):
     vibrant = _matugen(image, "vibrant")
     # Насыщенность меряем, только когда matugen вернул свой голубой: это лишняя
     # секунда на каждую картинку, а у цветных обоев ответ и так ясен.
-    if vibrant["primary"].lower() == MATUGEN_FALLBACK_PRIMARY and is_colorless(
-            vibrant["primary"], saturation(image)):
+    measured = True
+    colorless = False
+    if vibrant["primary"].lower() == MATUGEN_FALLBACK_PRIMARY:
+        value = saturation(image)
+        measured = value is not None
+        colorless = measured and is_colorless(vibrant["primary"], value)
+    if colorless:
         palette = _matugen(image, "monochrome")
         palette["_colorless"] = True
     elif SCHEME[mode] == "vibrant":
         palette = vibrant
     else:
         palette = _matugen(image, SCHEME[mode])
-    with contextlib.suppress(OSError):
-        _write(cache, json.dumps(palette))
+    # Не смогли измерить — не запоминаем: иначе ошибочный голубой застрял бы в кэше.
+    if measured:
+        with contextlib.suppress(OSError):
+            _write(cache, json.dumps(palette))
     return palette
 
 
-def warm_cache(images, mode):
-    """Заранее посчитать палитры для библиотеки обоев. Ошибки отдельных картинок
-    пропускаются: это подготовка, а не применение."""
+def is_cached(image, mode):
+    with contextlib.suppress(OSError):
+        return _cache_path(image, mode).is_file()
+    return False
+
+
+def library_images():
+    """Картинки из библиотеки обоев; нет папки — пустой список."""
+    try:
+        entries = list(WALLPAPER_DIR.iterdir())
+    except OSError:
+        return []
+    return sorted(p for p in entries if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
+
+
+def warm_cache(images, mode, still_wanted=lambda: True):
+    """Заранее посчитать палитры. Ошибки отдельных картинок пропускаются: это
+    подготовка, а не применение. `still_wanted` проверяется перед каждой картинкой —
+    переключили режим, и прогрев под старый режим прекращается."""
     done = 0
     for image in images:
-        with contextlib.suppress(ThemeError, OSError, ValueError):
+        if not still_wanted():
+            break
+        if is_cached(image, mode):
+            done += 1
+            continue
+        with contextlib.suppress(ThemeError, OSError, ValueError, KeyError):
             palette_from_image(image, mode)
             done += 1
     return done
+
+
+def warm(mode=None):
+    """Прогрев одним экземпляром: второй запуск ждёт первый, а затем почти ничего
+    не делает — всё уже в кэше. Так быстрые переключения режима не запускают
+    несколько matugen на 2 ядрах сразу."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(OUT_DIR / ".warm-lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        mode = mode or read_mode()
+        if mode == "off":
+            return 0
+        return warm_cache(library_images(), mode, still_wanted=lambda: read_mode() == mode)
 
 
 def _rgb(hex_color):
@@ -376,10 +423,8 @@ def set_hyprpanel(config, mode, image, originals=None, scheme=None):
     config = dict(config)
     if mode == "off":
         if not originals:
-            # Нечего возвращать — значит, мы ключи не трогали. Выключаем только
-            # включённое, отсутствующий ключ не дописываем.
-            if config.get("theme.matugen") is True:
-                config["theme.matugen"] = False
+            # Нечего возвращать — значит, мы ключи панели не трогали. Даже если в
+            # панели сам пользователь включил matugen, это его настройка.
             return config
         for key, value in originals.items():
             if value == _ABSENT:
@@ -433,7 +478,7 @@ def add_hook(text, line, after=None):
 
 
 _HOOK_LINE = re.compile(
-    r"^\s*(source\s*=|include\s|@import\s).*" + re.escape(MARK) + r"/", re.M)
+    r"^\s*(source\s*=|include\s|@import\s).*/" + re.escape(MARK) + r"/", re.M)
 
 
 def remove_hook(text):
@@ -609,6 +654,10 @@ def _refresh_locked(target, mode):
 
     if target in ("lock", "all"):
         image = current_image("lock")
+        if target == "lock" and image and Path(image).is_file() and not is_cached(image, mode):
+            # Новая картинка без готовой палитры: пересчёт перед блокировкой может
+            # не уложиться в отведённые 1,5 с. Прогрев досчитает её к следующему разу.
+            _warm_in_background()
         try:
             palette = palette_from_image(image, mode) if mode != "off" else None
             colors = HYPRLOCK_COLORS.read_text(encoding="utf-8") if HYPRLOCK_COLORS.is_file() else ""

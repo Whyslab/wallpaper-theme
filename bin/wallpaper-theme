@@ -45,12 +45,7 @@ def main(argv):
                 wt.notify("; ".join(problems))
             return 1 if problems else 0
         if cmd == "warm":
-            mode = wt.read_mode()
-            if mode == "off":
-                return 0
-            images = sorted(p for p in wt.WALLPAPER_DIR.iterdir()
-                            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
-            print(f"палитры посчитаны: {wt.warm_cache(images, mode)} из {len(images)}")
+            print(f"палитры готовы: {wt.warm()} из {len(wt.library_images())}")
             return 0
         if cmd == "integrate":
             for path in wt.integrate():

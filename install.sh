@@ -193,6 +193,12 @@ choose_theme() {
 PY
 fi
 
+if (( ! DRY )) && ! "$BIN" status 2>/dev/null | grep -q "^режим: off"; then
+    # Обновление при включённом режиме: досчитать палитры новых обоев заранее,
+    # иначе перед блокировкой на них не хватило бы отведённых 1,5 с.
+    ( nice -n 19 "$BIN" warm >/dev/null 2>&1 & )
+fi
+
 echo
 say "Готово. Режим сейчас: $("$BIN" status 2>/dev/null | head -1 || echo '?')"
 echo "   Включить: SUPER+R → Обои → «Интерфейс под обои», или: wallpaper-theme mode vivid"
