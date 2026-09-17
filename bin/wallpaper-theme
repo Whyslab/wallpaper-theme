@@ -39,7 +39,8 @@ def main(argv):
             if target not in ("desktop", "lock", "all"):
                 raise wt.ThemeError(f"неизвестная цель: {target}")
             if wt.read_mode() == "off":
-                return 0  # выключено — после смены обоев пересчитывать нечего
+                wt.ensure_files()  # подключаемые файлы нужны и в выключенном режиме
+                return 0  # после смены обоев пересчитывать нечего
             problems = wt.refresh(target)
             if problems:
                 wt.notify("; ".join(problems))

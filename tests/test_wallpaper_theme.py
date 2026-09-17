@@ -144,7 +144,9 @@ def home(tmp_path, monkeypatch):
         ),
         ".config/hypr/colors.conf": COLORS_CONF,
         ".config/kitty/kitty.conf": "background #0a0a0a\n",
-        ".config/hyprpanel/config.json": json.dumps({"theme.matugen": False, "theme.bar.background": "#000"}),
+        ".config/hyprpanel/config.json": json.dumps(
+            {"theme.bar.background": "#000", "menus.clock.weather.location": "Осло",
+             "wallpaper.image": "/old.png"}, indent=2, ensure_ascii=False),
         ".config/gtk-3.0/gtk.css": "@define-color window_bg_color #000000;\n",
         ".config/gtk-4.0/gtk.css": "@define-color window_bg_color #000000;\n/* gtk4 */\n",
         ".config/rofi/config.rasi": "* { bg: #0a0a0a; }\n",
@@ -156,6 +158,7 @@ def home(tmp_path, monkeypatch):
         path = tmp_path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+    (tmp_path / ".config/hyprpanel/config.json").chmod(0o600)
     (tmp_path / "wall.png").write_bytes(b"not really a png")
 
     def at(*parts):
@@ -163,7 +166,7 @@ def home(tmp_path, monkeypatch):
 
     monkeypatch.setattr(wt, "CONFIG_DIR", at(".config", "wallpaper-theme"))
     monkeypatch.setattr(wt, "MODE_FILE", at(".config", "wallpaper-theme", "mode"))
-    monkeypatch.setattr(wt, "OUT_DIR", at(".cache", "wallpaper-theme"))
+    monkeypatch.setattr(wt, "OUT_DIR", at(".local", "state", "wallpaper-theme"))
     monkeypatch.setattr(wt, "WALLPAPER_STATE", at(".local", "state", "hypr-wallpaper"))
     monkeypatch.setattr(wt, "HYPRLAND_CONF", at(".config", "hypr", "hyprland.conf"))
     monkeypatch.setattr(wt, "HYPRLOCK_CONF", at(".config", "hypr", "hyprlock.conf"))
@@ -192,7 +195,7 @@ def test_integrate_twice_changes_nothing_the_second_time(home):
     first = _snapshot(root, files)
     wt.integrate()
     assert _snapshot(root, files) == first
-    assert (root / ".cache/wallpaper-theme/hyprland.conf").is_file()
+    assert (root / ".local/state/wallpaper-theme/hyprland.conf").is_file()
 
 
 def test_on_then_off_restores_every_config_byte_for_byte(home):
@@ -201,18 +204,15 @@ def test_on_then_off_restores_every_config_byte_for_byte(home):
     integrated = _snapshot(root, files)
     wt.set_mode("vivid")
     on = _snapshot(root, files)
-    assert "adc6ff" in (root / ".cache/wallpaper-theme/rofi.rasi").read_text()
+    assert "adc6ff" in (root / ".local/state/wallpaper-theme/rofi.rasi").read_text()
     assert json.loads(on[".config/hyprpanel/config.json"])["theme.matugen"] is True
     assert "#0a0e17" in on[".config/gtk-3.0/gtk.css"]
     wt.set_mode("off")
     off = _snapshot(root, files)
     for rel in files:
-        if rel.endswith("config.json"):
-            continue  # панель: переключатель выключен, остальное сравнивается ниже
-        assert off[rel] == integrated[rel], rel
-    panel = json.loads(off[".config/hyprpanel/config.json"])
-    assert panel["theme.matugen"] is False and panel["theme.bar.background"] == "#000"
-    assert "adc6ff" not in (root / ".cache/wallpaper-theme/rofi.rasi").read_text()
+        assert off[rel] == integrated[rel], rel  # config.json панели тоже, побайтно
+    assert (root / ".config/hyprpanel/config.json").stat().st_mode & 0o777 == 0o600
+    assert "adc6ff" not in (root / ".local/state/wallpaper-theme/rofi.rasi").read_text()
 
 
 def test_unintegrate_returns_to_before_install(home):
@@ -224,8 +224,6 @@ def test_unintegrate_returns_to_before_install(home):
     wt.unintegrate()
     after = _snapshot(root, files)
     for rel in files:
-        if rel.endswith("config.json"):
-            continue
         assert after[rel] == before[rel], rel
 
 
@@ -233,14 +231,14 @@ def test_a_failed_palette_leaves_the_last_good_theme(home, monkeypatch):
     root, _, calls = home
     wt.integrate()
     wt.set_mode("vivid")
-    good = (root / ".cache/wallpaper-theme/rofi.rasi").read_text()
+    good = (root / ".local/state/wallpaper-theme/rofi.rasi").read_text()
 
     def broken(image, mode):
         raise wt.ThemeError("matugen не смог")
     monkeypatch.setattr(wt, "palette_from_image", broken)
     problems = wt.refresh("all")
     assert problems
-    assert (root / ".cache/wallpaper-theme/rofi.rasi").read_text() == good
+    assert (root / ".local/state/wallpaper-theme/rofi.rasi").read_text() == good
 
 
 def test_off_reloads_hyprland_and_on_sets_borders_live(home):
@@ -262,3 +260,91 @@ def test_mode_file_junk_means_off(home):
     (root / ".config/wallpaper-theme").mkdir(parents=True, exist_ok=True)
     (root / ".config/wallpaper-theme/mode").write_text("rainbow\n")
     assert wt.read_mode() == "off"
+
+
+def test_colorless_needs_both_signs():
+    assert wt.is_colorless("#ADC6FF", 0.0002)
+    assert not wt.is_colorless("#adc6ff", 0.2)     # голубая картинка
+    assert not wt.is_colorless("#30d7ff", 0.001)   # серая, но с цветным пятном
+
+
+def test_grey_wallpaper_gets_the_monochrome_scheme(monkeypatch, tmp_path):
+    image = tmp_path / "grey.png"
+    image.write_bytes(b"x")
+    asked = []
+    monkeypatch.setattr(wt, "_matugen", lambda img, scheme: asked.append(scheme) or
+                        dict(PALETTE, primary="#adc6ff" if scheme == "vibrant" else "#c6c6c6"))
+    monkeypatch.setattr(wt, "saturation", lambda img: 0.001)
+    palette = wt.palette_from_image(image, "vivid")
+    assert asked == ["vibrant", "monochrome"]
+    assert palette["primary"] == "#c6c6c6" and palette["_colorless"]
+
+
+def test_panel_gets_monochrome_for_grey_wallpaper(home, monkeypatch):
+    root, _, _ = home
+    wt.integrate()
+    monkeypatch.setattr(wt, "palette_from_image", lambda image, mode: dict(PALETTE, _colorless=True))
+    wt.set_mode("vivid")
+    panel = json.loads((root / ".config/hyprpanel/config.json").read_text())
+    assert panel["theme.matugen_settings.scheme_type"] == "monochrome"
+
+
+def test_write_keeps_permissions(tmp_path):
+    path = tmp_path / "secret.json"
+    path.write_text("{}")
+    path.chmod(0o600)
+    wt._write(path, "{\"a\": 1}")
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.read_text() == "{\"a\": 1}"
+
+
+def test_parallel_writes_do_not_collide(tmp_path):
+    import threading
+    path = tmp_path / "f.conf"
+    errors = []
+
+    def writer(n):
+        for i in range(300):
+            try:
+                wt._write(path, f"{n}-{i}\n")
+            except OSError as exc:
+                errors.append(exc)
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert not list(tmp_path.glob("*.wt-tmp"))
+
+
+def test_deleted_state_files_come_back_even_when_off(home):
+    root, _, _ = home
+    wt.integrate()
+    for f in (root / ".local/state/wallpaper-theme").glob("*.conf"):
+        f.unlink()
+    wt.refresh("all", "off")
+    assert (root / ".local/state/wallpaper-theme/hyprland.conf").is_file()
+
+
+def test_old_cache_hooks_are_replaced(home):
+    root, _, _ = home
+    conf = root / ".config/kitty/kitty.conf"
+    conf.write_text("background #0a0a0a\ninclude /x/.cache/wallpaper-theme/kitty.conf\n")
+    wt.integrate()
+    text = conf.read_text()
+    assert ".cache/wallpaper-theme" not in text
+    assert text.count("wallpaper-theme") == 1
+
+
+@pytest.mark.parametrize("name", ['a"b.png', "$(id).png", "`id`.png", "a\\b.png"])
+def test_unsafe_wallpaper_name_is_not_passed_to_the_panel(home, name):
+    root, _, _ = home
+    wt.integrate()
+    image = root / name
+    image.write_bytes(b"x")
+    (root / ".local/state/hypr-wallpaper/desktop.path").write_text(str(image))
+    problems = wt.set_mode("vivid")
+    panel = json.loads((root / ".config/hyprpanel/config.json").read_text())
+    assert "theme.matugen" not in panel
+    assert problems

@@ -70,13 +70,26 @@ from pathlib import Path
 scripts = Path(sys.argv[1])
 MARK = "wallpaper-theme"
 
+# Обновления уже встроенного кода из прошлых версий установщика.
+UPGRADES = [(
+'theme_refresh() {\n    command -v wallpaper-theme >/dev/null 2>&1 || return 0\n    ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )\n}',
+'theme_refresh() {\n    command -v wallpaper-theme >/dev/null 2>&1 || return 0\n    if [[ "$1" == lock ]]; then\n        # Блокировка — не в фоне: hypridle сразу после смены картинки запускает\n        # hyprlock, и он успел бы прочитать цвета прошлой картинки (~0,5–1 с).\n        wallpaper-theme refresh lock >/dev/null 2>&1\n    else\n        ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )\n    fi\n}',
+)]
+
 def patch(path, pairs):
     if not path.is_file():
         print(f"   !! нет {path} — пропускаю")
         return
     text = path.read_text(encoding="utf-8")
     if MARK in text:
-        print(f"   уже встроено: {path.name}")
+        upgraded = text
+        for old, new in UPGRADES:
+            upgraded = upgraded.replace(old, new)
+        if upgraded != text:
+            path.write_text(upgraded, encoding="utf-8")
+            print(f"   обновлено: {path.name}")
+        else:
+            print(f"   уже встроено: {path.name}")
         return
     for anchor, replacement in pairs:
         if text.count(anchor) != 1:
@@ -92,11 +105,17 @@ patch(scripts / "wallpaper.sh", [
 ''', '''# ---------- применение к каждой цели ----------
 
 # Интерфейс под обои (wallpaper-theme): пересчитать цвета после смены картинки.
-# В фоне — чтобы не задерживать саму смену обоев; при выключенном режиме
+# Рабочий стол — в фоне, чтобы не задерживать смену обоев; при выключенном режиме
 # команда сразу выходит. Нет программы — ничего не делаем.
 theme_refresh() {
     command -v wallpaper-theme >/dev/null 2>&1 || return 0
-    ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )
+    if [[ "$1" == lock ]]; then
+        # Блокировка — не в фоне: hypridle сразу после смены картинки запускает
+        # hyprlock, и он успел бы прочитать цвета прошлой картинки (~0,5–1 с).
+        wallpaper-theme refresh lock >/dev/null 2>&1
+    else
+        ( wallpaper-theme refresh "$1" >/dev/null 2>&1 & )
+    fi
 }
 '''),
     ('''    echo "$img" > "$STATE_DIR/desktop.path"

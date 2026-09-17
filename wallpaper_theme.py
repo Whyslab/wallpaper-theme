@@ -22,11 +22,13 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
 import signal
 import subprocess
+import tempfile
 from pathlib import Path
 
 MODES = ("off", "vivid", "tinted")
@@ -35,7 +37,18 @@ SCHEME = {"vivid": "vibrant", "tinted": "neutral"}
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "wallpaper-theme"
 MODE_FILE = CONFIG_DIR / "mode"
-OUT_DIR = HOME / ".cache" / "wallpaper-theme"
+# Не ~/.cache: на эти файлы ссылаются конфиги, а кэш по определению можно стереть —
+# Hyprland на отсутствующий source отвечает ошибкой при каждом входе.
+OUT_DIR = HOME / ".local" / "state" / "wallpaper-theme"
+LEGACY_OUT_DIR = HOME / ".cache" / "wallpaper-theme"
+
+
+def _panel_original():
+    return OUT_DIR / "hyprpanel-original.json"
+
+
+def _lock_file():
+    return OUT_DIR / ".lock"
 WALLPAPER_STATE = HOME / ".local" / "state" / "hypr-wallpaper"
 
 HYPRLAND_CONF = HOME / ".config" / "hypr" / "hyprland.conf"
@@ -85,22 +98,59 @@ def parse_matugen(output):
     return palette
 
 
-def palette_from_image(image, mode):
-    """Палитра по картинке. `--source-color-index 0`: без него matugen 4.2 на
-    картинке с несколькими главными цветами спрашивает пользователя в терминале,
-    а при запуске из скрипта просто падает."""
-    if mode not in SCHEME:
-        raise ThemeError(f"нет палитры для режима {mode}")
-    if not Path(image).is_file():
-        raise ThemeError(f"нет картинки обоев: {image}")
+# Что matugen отдаёт, когда в картинке нет цвета: встроенный голубой. Проверено на
+# библиотеке обоев 17.09.2026 — у 12 из 36 почти серых картинок primary ровно такой.
+MATUGEN_FALLBACK_PRIMARY = "#adc6ff"
+COLORLESS_SATURATION = 0.03
+
+
+def _matugen(image, scheme):
+    """`--source-color-index 0`: без него matugen 4.2 на картинке с несколькими
+    главными цветами спрашивает пользователя в терминале, а из скрипта падает."""
     result = subprocess.run(
-        ["matugen", "image", str(image), "-t", f"scheme-{SCHEME[mode]}", "-m", "dark",
+        ["matugen", "image", str(image), "-t", f"scheme-{scheme}", "-m", "dark",
          "--json", "hex", "--dry-run", "--source-color-index", "0", "-q"],
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise ThemeError(f"matugen не смог разобрать картинку: {result.stderr.strip()[:200]}")
     return parse_matugen(result.stdout)
+
+
+def saturation(image):
+    """Средняя насыщенность картинки 0..1 (уменьшенная копия, это быстро)."""
+    result = subprocess.run(
+        ["magick", str(image), "-resize", "96x96!", "-colorspace", "HSL",
+         "-channel", "G", "-separate", "+channel", "-format", "%[fx:mean]", "info:"],
+        capture_output=True, text=True, check=False,
+    )
+    try:
+        return max(0.0, float(result.stdout.strip()))
+    except ValueError:
+        return 1.0  # не смогли измерить — не считаем картинку серой
+
+
+def is_colorless(vibrant_primary, image_saturation):
+    """Серые обои: matugen не нашёл цвета (вернул свой голубой), и картинка правда
+    почти без цвета. Одного признака мало: у голубых картинок бывает похожий
+    primary, а у почти серой картинки с цветным пятном matugen находит настоящий."""
+    return (vibrant_primary.lower() == MATUGEN_FALLBACK_PRIMARY
+            and image_saturation < COLORLESS_SATURATION)
+
+
+def palette_from_image(image, mode):
+    """Палитра по картинке. У серых обоев — монохромная схема: иначе интерфейс
+    окрасился бы в голубой, которого на картинке нет."""
+    if mode not in SCHEME:
+        raise ThemeError(f"нет палитры для режима {mode}")
+    if not image or not Path(image).is_file():
+        raise ThemeError(f"нет картинки обоев: {image}")
+    vibrant = _matugen(image, "vibrant")
+    if is_colorless(vibrant["primary"], saturation(image)):
+        palette = _matugen(image, "monochrome")
+        palette["_colorless"] = True
+        return palette
+    return vibrant if SCHEME[mode] == "vibrant" else _matugen(image, SCHEME[mode])
 
 
 def _rgb(hex_color):
@@ -263,15 +313,36 @@ def render_hyprlock(p, colors_conf_text):
     return "".join(out)
 
 
-def set_hyprpanel(config, mode, image):
-    """Режим matugen у панели. Её собственные цвета не трогаются: panel сама
-    подменяет их при отрисовке, а при выключении берёт снова из конфига."""
+PANEL_KEYS = (
+    "theme.matugen", "theme.matugen_settings.scheme_type",
+    "theme.matugen_settings.mode", "wallpaper.image",
+)
+_ABSENT = {"__wallpaper_theme_absent__": True}
+# Панель подставляет путь в команду оболочки в двойных кавычках — такие символы
+# в имени файла выполнились бы как команда.
+_UNSAFE_PATH = re.compile(r'["$`\\]')
+
+
+def panel_originals(config):
+    """Значения ключей панели до первого включения — чтобы выключение вернуло их."""
+    return {k: config.get(k, _ABSENT) for k in PANEL_KEYS}
+
+
+def set_hyprpanel(config, mode, image, originals=None, scheme=None):
+    """Режим matugen у панели. Её собственные цвета не трогаются: панель сама
+    подменяет их при отрисовке. Выключение возвращает ключи, как были до включения."""
     config = dict(config)
     if mode == "off":
-        config["theme.matugen"] = False
+        for key, value in (originals or {}).items():
+            if value == _ABSENT:
+                config.pop(key, None)
+            else:
+                config[key] = value
+        if not originals:
+            config["theme.matugen"] = False
         return config
     config["theme.matugen"] = True
-    config["theme.matugen_settings.scheme_type"] = SCHEME[mode]
+    config["theme.matugen_settings.scheme_type"] = scheme or SCHEME[mode]
     config["theme.matugen_settings.mode"] = "dark"
     config["wallpaper.image"] = str(image)
     return config
@@ -330,10 +401,20 @@ def read_mode():
 
 
 def _write(path, text):
+    """Атомарно и с теми же правами, что были у файла (в config.json панели лежит
+    ключ погоды — расширять доступ к нему нельзя)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".wt-tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".wt-tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _edit(path, change):
@@ -348,9 +429,8 @@ def _edit(path, change):
     return True
 
 
-def integrate():
-    """Один раз: подключить сгенерированные файлы. Повторный вызов ничего не ломает."""
-    # Файлы должны существовать до того, как на них сошлются конфиги.
+def ensure_files():
+    """Подключаемые файлы должны существовать всегда, в любом режиме."""
     empty = {
         "hyprland.conf": render_hyprland(None),
         "hyprlock.conf": render_hyprlock(None, ""),
@@ -360,16 +440,26 @@ def integrate():
     for name, text in empty.items():
         if not (OUT_DIR / name).exists():
             _write(OUT_DIR / name, text)
+
+
+def _rehook(text, line, after=None):
+    """Убрать старые подключения (например, на прежний каталог) и поставить текущее."""
+    return add_hook(remove_hook(text), line, after=after)
+
+
+def integrate():
+    """Один раз: подключить сгенерированные файлы. Повторный вызов ничего не ломает."""
+    ensure_files()
     done = []
-    if _edit(HYPRLAND_CONF, lambda t: add_hook(t, hook_line("hyprland"))):
+    if _edit(HYPRLAND_CONF, lambda t: _rehook(t, hook_line("hyprland"))):
         done.append(str(HYPRLAND_CONF))
-    if _edit(HYPRLOCK_CONF, lambda t: add_hook(
+    if _edit(HYPRLOCK_CONF, lambda t: _rehook(
             t, hook_line("hyprlock"), after=r"^source\s*=.*colors\.conf.*$")):
         done.append(str(HYPRLOCK_CONF))
-    if _edit(KITTY_CONF, lambda t: add_hook(t, hook_line("kitty"))):
+    if _edit(KITTY_CONF, lambda t: _rehook(t, hook_line("kitty"))):
         done.append(str(KITTY_CONF))
     for rasi in ROFI_THEMES:
-        if _edit(rasi, lambda t: add_hook(t, hook_line("rofi"))):
+        if _edit(rasi, lambda t: _rehook(t, hook_line("rofi"))):
             done.append(str(rasi))
     for css in GTK_CSS:
         if _edit(css, lambda t: replace_gtk_block(t, None) if GTK_START not in t else t):
@@ -406,48 +496,80 @@ def notify(text):
     _run("notify-send", "-a", "Интерфейс под обои", "Интерфейс под обои", text)
 
 
+@contextlib.contextmanager
+def _locked():
+    """Один пересчёт за раз: иначе быстрые SUPER+W или выключение посреди пересчёта
+    оставляли бы цвета не той картинки, а то и включённую панель после off."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_lock_file(), "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def refresh(target="all", mode=None):
-    """Пересчитать и применить. target: desktop, lock или all."""
-    mode = mode or read_mode()
+    """Пересчитать и применить. target: desktop, lock или all. Возвращает список
+    проблем текстом; прошлые цвета при ошибке остаются как были."""
+    with _locked():
+        return _refresh_locked(target, mode or read_mode())
+
+
+def _refresh_locked(target, mode):
     problems = []
+    ensure_files()
 
     if target in ("desktop", "all"):
         image = current_image("desktop")
         palette = None
-        if mode != "off":
-            try:
-                palette = palette_from_image(image, mode) if image else None
-                if palette is None:
-                    raise ThemeError("не знаю, какие сейчас обои рабочего стола")
-            except ThemeError as exc:
-                problems.append(str(exc))
-        if mode == "off" or palette is not None:
+        try:
+            if mode != "off":
+                palette = palette_from_image(image, mode)
             _write(OUT_DIR / "hyprland.conf", render_hyprland(palette))
             _write(OUT_DIR / "kitty.conf", render_kitty(palette))
             _write(OUT_DIR / "rofi.rasi", render_rofi(palette))
             for css in GTK_CSS:
                 _edit(css, lambda t, p=palette: replace_gtk_block(t, p))
-            if HYPRPANEL_CONF.is_file():
-                panel = json.loads(HYPRPANEL_CONF.read_text(encoding="utf-8"))
-                updated = set_hyprpanel(panel, mode, image)
-                if updated != panel:
-                    _write(HYPRPANEL_CONF, json.dumps(updated, indent=2) + "\n")
+            problems += _update_panel(mode, image, palette)
             _apply_live(palette)
+        except (ThemeError, OSError, ValueError) as exc:
+            problems.append(str(exc))
 
     if target in ("lock", "all"):
         image = current_image("lock")
-        palette = None
-        if mode != "off":
-            try:
-                palette = palette_from_image(image, mode) if image else None
-                if palette is None:
-                    raise ThemeError("не знаю, какие сейчас обои блокировки")
-            except ThemeError as exc:
-                problems.append(str(exc))
-        if mode == "off" or palette is not None:
+        try:
+            palette = palette_from_image(image, mode) if mode != "off" else None
             colors = HYPRLOCK_COLORS.read_text(encoding="utf-8") if HYPRLOCK_COLORS.is_file() else ""
             _write(OUT_DIR / "hyprlock.conf", render_hyprlock(palette, colors))
+        except (ThemeError, OSError, ValueError) as exc:
+            problems.append(str(exc))
     return problems
+
+
+def _update_panel(mode, image, palette):
+    if not HYPRPANEL_CONF.is_file():
+        return []
+    raw = HYPRPANEL_CONF.read_text(encoding="utf-8")
+    config = json.loads(raw)
+    if mode != "off" and _UNSAFE_PATH.search(str(image)):
+        return [f"панель не перекрашена: в имени файла обоев есть кавычки или $ ({Path(image).name})"]
+    if mode != "off" and not _panel_original().exists():
+        _write(_panel_original(), json.dumps(panel_originals(config), ensure_ascii=False, indent=2))
+    originals = None
+    if mode == "off" and _panel_original().exists():
+        originals = json.loads(_panel_original().read_text(encoding="utf-8"))
+    # Серые обои: панели тоже монохромная схема, иначе она одна будет голубой.
+    scheme = None
+    if palette is not None and palette.get("_colorless"):
+        scheme = "monochrome"
+    updated = set_hyprpanel(config, mode, image, originals, scheme)
+    if updated != config:
+        tail = "\n" if raw.endswith("\n") else ""
+        _write(HYPRPANEL_CONF, json.dumps(updated, indent=2, ensure_ascii=False) + tail)
+    if mode == "off" and _panel_original().exists():
+        _panel_original().unlink()
+    return []
 
 
 def _apply_live(palette):
@@ -468,8 +590,9 @@ def _apply_live(palette):
 def set_mode(mode):
     if mode not in MODES:
         raise ThemeError(f"неизвестный режим: {mode}")
-    _write(MODE_FILE, mode + "\n")
-    problems = refresh("all", mode)
+    with _locked():
+        _write(MODE_FILE, mode + "\n")
+        problems = _refresh_locked("all", mode)
     label = {"off": "выключен", "vivid": "яркий", "tinted": "приглушённый"}[mode]
     if problems:
         notify(f"Режим {label}, но: " + "; ".join(problems))
